@@ -25,6 +25,8 @@ package com.sun.max.vm.verifier;
 import static com.sun.cri.bytecode.Bytecodes.*;
 import static com.sun.max.vm.verifier.types.VerificationType.*;
 
+import java.lang.reflect.*;
+
 import com.sun.cri.bytecode.*;
 import com.sun.max.lang.*;
 import com.sun.max.vm.*;
@@ -358,6 +360,56 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
      * The abstract interpreter that simulates the JVM instructions at the level of types (as opposed to values).
      */
     final class Interpreter extends BytecodeVisitor {
+        private ClassConstant classAt(int index) {
+            return classAt(index, null);
+        }
+
+        private ClassConstant classAt(int index, String message) {
+            ClassConstant cls = constantPool().classAt(index, message);
+            // throws LinkageError
+            cls.resolve(constantPool(), index);
+            return cls;
+        }
+
+        private FieldRefConstant fieldAt(int index, int opcode) {
+            FieldRefConstant fieldConstant = constantPool().fieldAt(index);
+            // throws LinkageError
+            FieldActor field = fieldConstant.resolve(constantPool(), index);
+
+            if (opcode == GETSTATIC && !field.isStatic())
+                verifyError("ClassChangeError: cannot get non-static field with getstatic");
+            else if (opcode == GETFIELD && field.isStatic())
+                verifyError("ClassChangeError: cannot get static field with getfield");
+
+            return fieldConstant;
+        }
+
+        private InterfaceMethodRefConstant interfaceMethodAt(int index) {
+            InterfaceMethodRefConstant methodConstant = constantPool().interfaceMethodAt(index);
+            MethodActor method = methodConstant.resolve(constantPool(), index); // throws LinkageError
+            if (method.isStatic())
+                verifyError("ClassChangeError: cannot invoke static method with invokeinterface");
+
+            return methodConstant;
+        }
+
+        private MethodRefConstant methodAt(int index, int opcode) {
+            MethodRefConstant methodConstant = constantPool().methodAt(index);
+            MethodActor method = methodConstant.resolve(constantPool(), index); // throws LinkageError
+
+            if (opcode == INVOKESTATIC && !method.isStatic())
+                verifyError("ClassChangeError: cannot invoke non-static method with invokestatic");
+            else if (opcode == INVOKEVIRTUAL && method.isStatic())
+                verifyError("ClassChangeError: cannot invoke static method with invokevirtual");
+
+            return methodConstant;
+        }
+
+        private void checkInstantiation(TypeDescriptor typeDescriptor) {
+            Class cls = typeDescriptor.resolveType(getClass().getClassLoader());
+            if ( Modifier.isAbstract(cls.getModifiers()) || Modifier.isInterface(cls.getModifiers()) )
+                verifyError("InstantiationError: cannot instantiate abstract class or interface");
+        }
 
         private boolean constructorInvoked;
 
@@ -419,7 +471,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
         @Override
         public void anewarray(int index) {
             frame.pop(INTEGER);
-            final TypeDescriptor elementDescriptor = constantPool().classAt(index).typeDescriptor();
+            final TypeDescriptor elementDescriptor = classAt(index).typeDescriptor();
             try {
                 final ReferenceOrWordType element = (ReferenceOrWordType) getVerificationType(elementDescriptor);
                 frame.push(getObjectType(JavaTypeDescriptor.getArrayDescriptorForDescriptor(element.typeDescriptor(), 1)));
@@ -520,7 +572,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
         public void checkcast(int index) {
             frame.pop(REFERENCE);
 
-            final ClassConstant classConstant = constantPool().classAt(index);
+            final ClassConstant classConstant = classAt(index);
             final TypeDescriptor toType = classConstant.typeDescriptor();
             if (JavaTypeDescriptor.isPrimitive(toType)) {
                 verifyError("Invalid use of primitive type in CHECKCAST: " + toType);
@@ -911,7 +963,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
 
         @Override
         public void getfield(int index) {
-            final FieldRefConstant fieldConstant = constantPool().fieldAt(index);
+            final FieldRefConstant fieldConstant = fieldAt(index, GETFIELD);
             final TypeDescriptor fieldType = fieldConstant.type(constantPool());
             final VerificationType value = getVerificationType(fieldType);
             final VerificationType object = frame.pop(getObjectType(fieldConstant.holder(constantPool())));
@@ -921,7 +973,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
 
         @Override
         public void getstatic(int index) {
-            final FieldRefConstant fieldConstant = constantPool().fieldAt(index);
+            final FieldRefConstant fieldConstant = fieldAt(index, GETSTATIC);
             final VerificationType value = getVerificationType(fieldConstant.type(constantPool()));
             frame.push(value);
         }
@@ -959,7 +1011,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
                 superClassActor = superClassActor.superClassActor;
             }
 
-            // The field being accessed belongs to a class that isn't a superclass of the current class.
+            // TODO: The field being accessed belongs to a class that isn't a superclass of the current class.
             // The access control check will be performed at run time as part of field resolution.
         }
 
@@ -1195,7 +1247,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
 
         @Override
         public void instanceof_(int index) {
-            constantPool().classAt(index);
+            classAt(index);
             frame.pop(REFERENCE);
             frame.push(INTEGER);
         }
@@ -1254,11 +1306,12 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
 
             // The method being accessed belongs to a class that isn't a superclass of the current class.
             // The access control check will be performed at run time as part of method resolution.
+            // TODO: LinkageError
         }
 
         @Override
         public void invokeinterface(int index, int count) {
-            final InterfaceMethodRefConstant methodConstant = constantPool().interfaceMethodAt(index);
+            final InterfaceMethodRefConstant methodConstant = interfaceMethodAt(index);
             final Utf8Constant methodName = methodConstant.name(constantPool());
             if (methodName.toString().startsWith("<")) {
                 verifyError("Invalid INVOKEINTERFACE on initialization method");
@@ -1296,7 +1349,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
 
         @Override
         public void invokespecial(int index) {
-            final MethodRefConstant methodConstant = constantPool().methodAt(index);
+            final MethodRefConstant methodConstant = methodAt(index, INVOKESPECIAL);
             final Utf8Constant name = methodConstant.name(constantPool());
             if (name.equals(SymbolTable.CLINIT)) {
                 verifyError("Cannot invoke <clinit> method");
@@ -1345,7 +1398,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
             final byte[] bytecodes = bytecodeScanner().bytecodeBlock().code();
             try {
                 final int constantPoolIndex = ((bytecodes[bci + 1] & 0xFF) << 8) | (bytecodes[bci + 2] & 0xFF);
-                return constantPool().classAt(constantPoolIndex).typeDescriptor();
+                return classAt(constantPoolIndex).typeDescriptor();
             } catch (ArrayIndexOutOfBoundsException arrayIndexOutOfBoundsException) {
                 throw fatalVerifyError("Invalid NEW instruction at BCI " + bci);
             }
@@ -1353,7 +1406,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
 
         @Override
         public void invokestatic(int index) {
-            final MethodRefConstant methodConstant = constantPool().methodAt(index);
+            final MethodRefConstant methodConstant = methodAt(index, INVOKESTATIC);
             if (methodConstant.name(constantPool()).toString().startsWith("<")) {
                 verifyError("Invalid INVOKESTATIC on initialization method");
             }
@@ -1364,7 +1417,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
 
         @Override
         public void invokevirtual(int index) {
-            final MethodRefConstant methodConstant = constantPool().methodAt(index);
+            final MethodRefConstant methodConstant = methodAt(index, INVOKEVIRTUAL);
             if (methodConstant.name(constantPool()).toString().startsWith("<")) {
                 verifyError("Invalid INVOKEVIRTUAL on initialization method");
             }
@@ -1694,7 +1747,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
                 frame.pop(INTEGER);
             }
 
-            final ClassConstant classConstant = constantPool().classAt(index);
+            final ClassConstant classConstant = classAt(index);
             final TypeDescriptor type = classConstant.typeDescriptor();
             if (!JavaTypeDescriptor.isArray(type)) {
                 verifyError("MULTIANEWARRAY cannot be applied to non-array type " + type);
@@ -1712,7 +1765,9 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
                 verifyError("Uninitialized type already exists on the stack: " + value);
             }
 
-            if (JavaTypeDescriptor.isArray(constantPool().classAt(index, "array type descriptor").typeDescriptor())) {
+            TypeDescriptor typeDescriptor = classAt(index, "array type descriptor").typeDescriptor();
+            checkInstantiation(typeDescriptor);
+            if (JavaTypeDescriptor.isArray(typeDescriptor)) {
                 verifyError("Invalid use of NEW instruction to create an array");
             }
 
@@ -1748,7 +1803,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
 
         @Override
         public void putfield(int index) {
-            final FieldRefConstant fieldConstant = constantPool().fieldAt(index);
+            final FieldRefConstant fieldConstant = fieldAt(index, PUTFIELD);
 
             frame.pop(getVerificationType(fieldConstant.type(constantPool())));
             final VerificationType expectedObjectType = getObjectType(fieldConstant.holder(constantPool()));
@@ -1762,7 +1817,7 @@ public class TypeCheckingMethodVerifier extends MethodVerifier {
 
         @Override
         public void putstatic(int index) {
-            final FieldRefConstant fieldConstant = constantPool().fieldAt(index);
+            final FieldRefConstant fieldConstant = fieldAt(index, PUTSTATIC);
             final VerificationType value = getVerificationType(fieldConstant.type(constantPool()));
             frame.pop(value);
         }

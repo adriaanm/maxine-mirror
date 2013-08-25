@@ -181,6 +181,8 @@ public class Verifier implements VerificationRegistry {
         }
         ObjectType objectType = objectTypes.get(typeDescriptor);
         if (objectType == null) {
+            // throws LinkageError if type can't be resolved
+            resolve(typeDescriptor);
             objectType = JavaTypeDescriptor.isArray(typeDescriptor) ? new ArrayType(typeDescriptor, this) : new ObjectType(typeDescriptor, this);
             objectTypes.put(typeDescriptor, objectType);
         }
